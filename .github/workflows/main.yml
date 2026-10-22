@@ -13,6 +13,8 @@ jobs:
       - name: Configure RDP
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' -Value 0 -Force
@@ -46,25 +48,48 @@ jobs:
           $password = $env:CUSTOM_RDP_PASSWORD
 
           if ([string]::IsNullOrWhiteSpace($password)) {
-            throw 'RDP_PASSWORD repository secret is missing.'
+            throw 'RDP_PASSWORD secret is missing or empty.'
           }
 
           if ($password.Length -lt 12) {
-            throw 'Choose a password with at least 12 characters.'
+            throw 'Password must be at least 12 characters.'
+          }
+
+          if ($password -match '^\s|\s$') {
+            throw 'Password cannot start or end with whitespace.'
+          }
+
+          if ($password -match '(?i)tasfiq|sami') {
+            throw 'Choose a password that does not contain Tasfiq or sami.'
+          }
+
+          $hasUpper = $password -cmatch '[A-Z]'
+          $hasLower = $password -cmatch '[a-z]'
+          $hasDigit = $password -match '\d'
+          $hasSymbol = $password -match '[^a-zA-Z0-9]'
+
+          if (@($hasUpper, $hasLower, $hasDigit, $hasSymbol |
+               Where-Object { $_ }).Count -lt 3) {
+            throw 'Use at least three character types: uppercase, lowercase, numbers, and symbols.'
           }
 
           $securePassword = ConvertTo-SecureString `
-            $password -AsPlainText -Force
+            -String $password -AsPlainText -Force
 
           $existing = Get-LocalUser -Name $username `
             -ErrorAction SilentlyContinue
 
-          if ($existing) {
-            Set-LocalUser -Name $username -Password $securePassword
-          } else {
-            New-LocalUser -Name $username `
-              -Password $securePassword `
-              -AccountNeverExpires | Out-Null
+          try {
+            if ($existing) {
+              Set-LocalUser -Name $username -Password $securePassword
+            } else {
+              New-LocalUser `
+                -Name $username `
+                -Password $securePassword `
+                -AccountNeverExpires | Out-Null
+            }
+          } catch {
+            throw "Windows rejected the password or account operation. Check the password requirements. $($_.Exception.Message)"
           }
 
           Add-LocalGroupMember -Group 'Administrators' `
@@ -74,7 +99,8 @@ jobs:
             -Member $username -ErrorAction SilentlyContinue
 
           "RDP_USERNAME=$username" >> $env:GITHUB_ENV
-          Write-Host 'Tasfiq account configured.'
+
+          Write-Host 'Tasfiq account configured successfully.'
 
       - name: Install applications and developer CLIs
         shell: pwsh
@@ -107,7 +133,7 @@ jobs:
                 --disable-interactivity
 
               if ($LASTEXITCODE -ne 0) {
-                Write-Warning "Could not install $app"
+                Write-Warning "Installation failed or was skipped: $app"
               }
             }
 
@@ -123,19 +149,20 @@ jobs:
             }
           }
 
-          $nodeDir = 'C:\Program Files\nodejs'
-
-          if (Test-Path $nodeDir) {
-            $env:Path = "$nodeDir;$env:Path"
-          }
-
           $machinePath = [Environment]::GetEnvironmentVariable(
             'Path', 'Machine'
           )
           $userPath = [Environment]::GetEnvironmentVariable(
             'Path', 'User'
           )
+
           $env:Path = "$machinePath;$userPath;$env:Path"
+
+          $nodeDir = 'C:\Program Files\nodejs'
+
+          if (Test-Path $nodeDir) {
+            $env:Path = "$nodeDir;$env:Path"
+          }
 
           if (Get-Command npm.cmd -ErrorAction SilentlyContinue) {
             $packages = @(
@@ -146,21 +173,25 @@ jobs:
             )
 
             foreach ($package in $packages) {
+              Write-Host "Installing CLI: $package"
+
               npm.cmd install --global $package
 
               if ($LASTEXITCODE -ne 0) {
-                Write-Warning "Could not install CLI $package"
+                Write-Warning "CLI installation failed: $package"
               }
             }
           } else {
             Write-Warning 'npm unavailable. Skipping developer CLIs.'
           }
 
-          Write-Host 'Installation step finished.'
+          Write-Host 'Application installation step completed.'
 
       - name: Install Tailscale
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi'
           $file = "$env:TEMP\tailscale.msi"
 
@@ -170,7 +201,7 @@ jobs:
             -ArgumentList '/i', "`"$file`"", '/quiet', '/norestart' `
             -Wait -PassThru
 
-          Remove-Item $file -Force
+          Remove-Item $file -Force -ErrorAction SilentlyContinue
 
           if ($process.ExitCode -notin @(0, 3010)) {
             throw "Tailscale installation failed: $($process.ExitCode)"
@@ -219,6 +250,8 @@ jobs:
       - name: Verify RDP service
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           $service = Get-Service TermService
 
           if ($service.Status -ne 'Running') {
@@ -244,7 +277,7 @@ jobs:
           Write-Host '=== RDP ACCESS ==='
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: $env:RDP_USERNAME"
-          Write-Host 'Password: the value saved in your RDP_PASSWORD secret'
+          Write-Host 'Password: use the value stored in your RDP_PASSWORD secret.'
           Write-Host '=================='
 
           while ($true) {
