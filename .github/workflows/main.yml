@@ -82,6 +82,7 @@ jobs:
           try {
             if ($existing) {
               Set-LocalUser -Name $username -Password $securePassword
+              Enable-LocalUser -Name $username
             } else {
               New-LocalUser `
                 -Name $username `
@@ -89,7 +90,7 @@ jobs:
                 -AccountNeverExpires | Out-Null
             }
           } catch {
-            throw "Windows rejected the password or account operation. Check the password requirements. $($_.Exception.Message)"
+            throw "Windows rejected the password or account operation. $($_.Exception.Message)"
           }
 
           Add-LocalGroupMember -Group 'Administrators' `
@@ -102,90 +103,74 @@ jobs:
 
           Write-Host 'Tasfiq account configured successfully.'
 
-      - name: Install applications and developer CLIs
+      - name: Enable dark mode for Tasfiq
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Continue'
+          $ErrorActionPreference = 'Stop'
+          $username = 'Tasfiq'
+          $user = Get-LocalUser -Name $username
+          $sid = $user.SID.Value
 
-          $winget = Get-Command winget.exe `
-            -ErrorAction SilentlyContinue
+          $profile = Get-CimInstance Win32_UserProfile |
+            Where-Object { $_.SID -eq $sid }
 
-          if (-not $winget) {
-            Write-Warning 'WinGet unavailable. Skipping desktop app installations.'
+          if (-not $profile -or -not $profile.LocalPath) {
+            throw 'Tasfiq user profile was not created.'
+          }
+
+          $hiveFile = Join-Path $profile.LocalPath 'NTUSER.DAT'
+          $hiveName = "TasfiqTempHive_$env:GITHUB_RUN_ID"
+          $loadedByUs = $false
+
+          if (Test-Path "Registry::HKEY_USERS\$sid") {
+            $registryRoot = "Registry::HKEY_USERS\$sid"
           } else {
-            $apps = @(
-              'Brave.Brave'
-              'Microsoft.VisualStudioCode'
-              'JavadMotallebi.NeatDownloadManager'
-              'Discord.Discord'
-              'Git.Git'
-              'GitHub.cli'
-              'OpenJS.NodeJS.LTS'
-            )
-
-            foreach ($app in $apps) {
-              Write-Host "Installing $app"
-
-              winget install --exact --id $app `
-                --silent `
-                --accept-package-agreements `
-                --accept-source-agreements `
-                --disable-interactivity
-
-              if ($LASTEXITCODE -ne 0) {
-                Write-Warning "Installation failed or was skipped: $app"
-              }
+            if (-not (Test-Path $hiveFile)) {
+              throw "User registry hive not found: $hiveFile"
             }
 
-            winget install --id 9PLM9XGG6VKS `
-              --source msstore `
-              --silent `
-              --accept-package-agreements `
-              --accept-source-agreements `
-              --disable-interactivity
+            & reg.exe load "HKU\$hiveName" $hiveFile
 
             if ($LASTEXITCODE -ne 0) {
-              Write-Warning 'ChatGPT desktop app installation failed.'
+              throw 'Failed to load Tasfiq user registry hive.'
             }
+
+            $loadedByUs = $true
+            $registryRoot = "Registry::HKEY_USERS\$hiveName"
           }
 
-          $machinePath = [Environment]::GetEnvironmentVariable(
-            'Path', 'Machine'
-          )
-          $userPath = [Environment]::GetEnvironmentVariable(
-            'Path', 'User'
-          )
+          try {
+            $personalize = Join-Path $registryRoot `
+              'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
 
-          $env:Path = "$machinePath;$userPath;$env:Path"
+            New-Item -Path $personalize -Force | Out-Null
 
-          $nodeDir = 'C:\Program Files\nodejs'
+            New-ItemProperty -Path $personalize `
+              -Name AppsUseLightTheme -PropertyType DWord `
+              -Value 0 -Force | Out-Null
 
-          if (Test-Path $nodeDir) {
-            $env:Path = "$nodeDir;$env:Path"
+            New-ItemProperty -Path $personalize `
+              -Name SystemUsesLightTheme -PropertyType DWord `
+              -Value 0 -Force | Out-Null
+
+            New-ItemProperty -Path $personalize `
+              -Name EnableTransparency -PropertyType DWord `
+              -Value 0 -Force | Out-Null
+
+            Write-Host 'Dark mode configured for Tasfiq.'
           }
+          finally {
+            if ($loadedByUs) {
+              [gc]::Collect()
+              [gc]::WaitForPendingFinalizers()
 
-          if (Get-Command npm.cmd -ErrorAction SilentlyContinue) {
-            $packages = @(
-              '@openai/codex'
-              '@anthropic-ai/claude-code'
-              'vercel'
-              '@github/copilot'
-            )
-
-            foreach ($package in $packages) {
-              Write-Host "Installing CLI: $package"
-
-              npm.cmd install --global $package
+              & reg.exe unload "HKU\$hiveName"
 
               if ($LASTEXITCODE -ne 0) {
-                Write-Warning "CLI installation failed: $package"
+                Write-Warning 'Could not unload the temporary registry hive.'
               }
             }
-          } else {
-            Write-Warning 'npm unavailable. Skipping developer CLIs.'
           }
-
-          Write-Host 'Application installation step completed.'
 
       - name: Install Tailscale
         shell: pwsh
@@ -197,14 +182,17 @@ jobs:
 
           Invoke-WebRequest -Uri $url -OutFile $file
 
-          $process = Start-Process msiexec.exe `
-            -ArgumentList '/i', "`"$file`"", '/quiet', '/norestart' `
-            -Wait -PassThru
+          try {
+            $process = Start-Process msiexec.exe `
+              -ArgumentList '/i', "`"$file`"", '/quiet', '/norestart' `
+              -Wait -PassThru
 
-          Remove-Item $file -Force -ErrorAction SilentlyContinue
-
-          if ($process.ExitCode -notin @(0, 3010)) {
-            throw "Tailscale installation failed: $($process.ExitCode)"
+            if ($process.ExitCode -notin @(0, 3010)) {
+              throw "Tailscale installation failed: $($process.ExitCode)"
+            }
+          }
+          finally {
+            Remove-Item $file -Force -ErrorAction SilentlyContinue
           }
 
       - name: Establish Tailscale connection
