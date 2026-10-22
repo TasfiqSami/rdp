@@ -4,13 +4,16 @@ name: RDP
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 36000
+    timeout-minutes: 3600
 
     steps:
-      - name: Configure RDP
+      - name: Configure RDP and firewall
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -36,7 +39,9 @@ jobs:
             -Action Allow `
             -Protocol TCP `
             -LocalPort 3389 `
-            -RemoteAddress 100.64.0.0/10
+            -RemoteAddress 100.64.0.0/10 | Out-Null
+
+          Write-Host 'RDP configured.'
 
       - name: Create Tasfiq account
         shell: pwsh
@@ -63,13 +68,14 @@ jobs:
             throw 'Choose a password that does not contain Tasfiq or sami.'
           }
 
-          $hasUpper = $password -cmatch '[A-Z]'
-          $hasLower = $password -cmatch '[a-z]'
-          $hasDigit = $password -match '\d'
-          $hasSymbol = $password -match '[^a-zA-Z0-9]'
+          $types = @(
+            ($password -cmatch '[A-Z]')
+            ($password -cmatch '[a-z]')
+            ($password -match '\d')
+            ($password -match '[^a-zA-Z0-9]')
+          )
 
-          if (@($hasUpper, $hasLower, $hasDigit, $hasSymbol |
-               Where-Object { $_ }).Count -lt 3) {
+          if (@($types | Where-Object { $_ }).Count -lt 3) {
             throw 'Use at least three character types: uppercase, lowercase, numbers, and symbols.'
           }
 
@@ -89,73 +95,186 @@ jobs:
               -AccountNeverExpires | Out-Null
           }
 
-          Add-LocalGroupMember -Group 'Administrators' `
-            -Member $username -ErrorAction SilentlyContinue
+          $userSid = (Get-LocalUser -Name $username).SID.Value
 
-          Add-LocalGroupMember -Group 'Remote Desktop Users' `
-            -Member $username -ErrorAction SilentlyContinue
+          foreach ($group in @('Administrators', 'Remote Desktop Users')) {
+            $members = Get-LocalGroupMember -Group $group `
+              -ErrorAction SilentlyContinue
+
+            if (-not ($members | Where-Object { $_.SID.Value -eq $userSid })) {
+              Add-LocalGroupMember -Group $group -Member $username
+            }
+          }
 
           "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          Write-Host 'Tasfiq account configured.'
 
-          Write-Host 'Tasfiq account configured successfully.'
-
-      - name: Enable dark mode for Tasfiq
+      - name: Prepare post-login setup
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $username = 'Tasfiq'
-          $user = Get-LocalUser -Name $username -ErrorAction Stop
-          $sid = $user.SID.Value
+          $dir = 'C:\RDPSetup'
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
-          $profile = Get-CimInstance Win32_UserProfile |
-            Where-Object { $_.SID -eq $sid } |
-            Select-Object -First 1
+          # Dark mode runs in Tasfiq's interactive session.
+          $darkScript = Join-Path $dir 'Set-DarkMode.ps1'
 
-          if (-not $profile) {
-            Write-Warning 'Tasfiq profile does not exist yet. Skipping dark mode setup for now.'
-            exit 0
-          }
+          @'
+          Start-Sleep -Seconds 25
 
-          $ntUserDat = Join-Path $profile.LocalPath 'NTUSER.DAT'
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+          New-Item -Path $key -Force | Out-Null
 
-          if (-not (Test-Path $ntUserDat)) {
-            Write-Warning 'Tasfiq NTUSER.DAT does not exist yet. Skipping dark mode setup for now.'
-            exit 0
-          }
+          Set-ItemProperty -Path $key -Name AppsUseLightTheme -Value 0 -Type DWord
+          Set-ItemProperty -Path $key -Name SystemUsesLightTheme -Value 0 -Type DWord
+          Set-ItemProperty -Path $key -Name EnableTransparency -Value 0 -Type DWord
 
-          $hivePath = "Registry::HKEY_USERS\$sid"
-          $loadedByScript = $false
+          Write-Host 'Dark mode enabled.'
+          '@ | Set-Content -Path $darkScript -Encoding UTF8
 
-          try {
-            if (-not (Test-Path $hivePath)) {
-              & reg.exe load 'HKU\TasfiqTemp' $ntUserDat
+          $principal = New-ScheduledTaskPrincipal `
+            -UserId 'Tasfiq' `
+            -LogonType Interactive `
+            -RunLevel Limited
+
+          $trigger = New-ScheduledTaskTrigger -AtLogOn -User 'Tasfiq'
+
+          $darkAction = New-ScheduledTaskAction `
+            -Execute 'powershell.exe' `
+            -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$darkScript`""
+
+          Register-ScheduledTask `
+            -TaskName 'Tasfiq-DarkMode' `
+            -Action $darkAction `
+            -Trigger $trigger `
+            -Principal $principal `
+            -Force | Out-Null
+
+          # Create the app installer. It only runs after interactive login.
+          $installer = Join-Path $dir 'Install-Apps.ps1'
+
+          @'
+          $ErrorActionPreference = 'Continue'
+
+          Start-Sleep -Seconds 30
+
+          $desktop = [Environment]::GetFolderPath('Desktop')
+          $log = Join-Path $desktop 'Install-Everything.log'
+          Start-Transcript -Path $log -Append
+
+          Write-Host '========================================' -ForegroundColor Cyan
+          Write-Host ' TASFIQ RDP APPLICATION INSTALLER' -ForegroundColor Cyan
+          Write-Host '========================================' -ForegroundColor Cyan
+
+          $env:Path += ";$env:LOCALAPPDATA\Microsoft\WindowsApps;$env:ProgramFiles\nodejs"
+
+          $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+
+          if ($winget) {
+            $apps = @(
+              'Brave.Brave'
+              'Microsoft.VisualStudioCode'
+              'JavadMotallebi.NeatDownloadManager'
+              'Discord.Discord'
+              'Git.Git'
+              'GitHub.cli'
+              'OpenJS.NodeJS.LTS'
+              'Google.Antigravity'
+            )
+
+            foreach ($app in $apps) {
+              Write-Host "`nInstalling $app ..." -ForegroundColor Yellow
+
+              & winget install --exact --id $app `
+                --silent `
+                --accept-package-agreements `
+                --accept-source-agreements `
+                --disable-interactivity
 
               if ($LASTEXITCODE -ne 0) {
-                throw 'Could not load Tasfiq user registry hive.'
+                Write-Warning "Failed or skipped: $app (exit $LASTEXITCODE)"
+              } else {
+                Write-Host "$app installed." -ForegroundColor Green
               }
-
-              $hivePath = 'Registry::HKEY_USERS\TasfiqTemp'
-              $loadedByScript = $true
             }
 
-            $personalize = Join-Path $hivePath 'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+            Write-Host "`nTrying ChatGPT desktop app..." -ForegroundColor Yellow
 
-            New-Item -Path $personalize -Force | Out-Null
+            & winget install --id 9PLM9XGG6VKS `
+              --source msstore `
+              --silent `
+              --accept-package-agreements `
+              --accept-source-agreements `
+              --disable-interactivity
 
-            Set-ItemProperty -Path $personalize -Name AppsUseLightTheme -Value 0 -Type DWord
-            Set-ItemProperty -Path $personalize -Name SystemUsesLightTheme -Value 0 -Type DWord
-            Set-ItemProperty -Path $personalize -Name EnableTransparency -Value 0 -Type DWord
-
-            Write-Host 'Dark mode configured for Tasfiq.'
-          }
-          finally {
-            if ($loadedByScript) {
-              [gc]::Collect()
-              [gc]::WaitForPendingFinalizers()
-              & reg.exe unload 'HKU\TasfiqTemp' | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning 'ChatGPT desktop installation failed. Use https://chatgpt.com if needed.'
             }
+          } else {
+            Write-Warning 'WinGet is unavailable for this user. Desktop app installations were skipped.'
           }
+
+          # Install developer CLIs after Node.js.
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $env:Path = "$machinePath;$userPath;$env:LOCALAPPDATA\Microsoft\WindowsApps;$env:ProgramFiles\nodejs"
+
+          if (Get-Command npm.cmd -ErrorAction SilentlyContinue) {
+            foreach ($package in @(
+              '@openai/codex'
+              '@anthropic-ai/claude-code'
+              'vercel'
+              '@github/copilot'
+            )) {
+              Write-Host "`nInstalling CLI $package ..." -ForegroundColor Yellow
+              & npm.cmd install --global $package
+
+              if ($LASTEXITCODE -ne 0) {
+                Write-Warning "CLI installation failed: $package"
+              }
+            }
+          } else {
+            Write-Warning 'npm is unavailable. Reopen PowerShell and retry the CLI installations.'
+          }
+
+          # Install the official Antigravity CLI as well.
+          Write-Host "`nInstalling Google Antigravity CLI..." -ForegroundColor Yellow
+
+          try {
+            $cliInstaller = Join-Path $env:TEMP 'install-antigravity-cli.ps1'
+            Invoke-WebRequest `
+              -Uri 'https://antigravity.google/cli/install.ps1' `
+              -OutFile $cliInstaller
+
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cliInstaller
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning 'Antigravity CLI installer returned a nonzero exit code.'
+            }
+          } catch {
+            Write-Warning "Antigravity CLI installation failed: $($_.Exception.Message)"
+          }
+
+          Write-Host "`nInstallation finished. Check the desktop log for details." -ForegroundColor Green
+          Stop-Transcript
+          '@ | Set-Content -Path $installer -Encoding UTF8
+
+          $installAction = New-ScheduledTaskAction `
+            -Execute 'powershell.exe' `
+            -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$installer`""
+
+          Register-ScheduledTask `
+            -TaskName 'Tasfiq-Install-Apps' `
+            -Action $installAction `
+            -Trigger $trigger `
+            -Principal $principal `
+            -Settings (New-ScheduledTaskSettingsSet `
+              -ExecutionTimeLimit (New-TimeSpan -Hours 3) `
+              -StartWhenAvailable) `
+            -Force | Out-Null
+
+          Write-Host 'Dark mode and app installation are scheduled for Tasfiq login.'
 
       - name: Install Tailscale
         shell: pwsh
