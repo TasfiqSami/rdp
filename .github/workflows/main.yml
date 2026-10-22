@@ -79,18 +79,14 @@ jobs:
           $existing = Get-LocalUser -Name $username `
             -ErrorAction SilentlyContinue
 
-          try {
-            if ($existing) {
-              Set-LocalUser -Name $username -Password $securePassword
-              Enable-LocalUser -Name $username
-            } else {
-              New-LocalUser `
-                -Name $username `
-                -Password $securePassword `
-                -AccountNeverExpires | Out-Null
-            }
-          } catch {
-            throw "Windows rejected the password or account operation. $($_.Exception.Message)"
+          if ($existing) {
+            Set-LocalUser -Name $username -Password $securePassword
+            Enable-LocalUser -Name $username
+          } else {
+            New-LocalUser `
+              -Name $username `
+              -Password $securePassword `
+              -AccountNeverExpires | Out-Null
           }
 
           Add-LocalGroupMember -Group 'Administrators' `
@@ -107,68 +103,57 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+
           $username = 'Tasfiq'
-          $user = Get-LocalUser -Name $username
+          $user = Get-LocalUser -Name $username -ErrorAction Stop
           $sid = $user.SID.Value
 
           $profile = Get-CimInstance Win32_UserProfile |
-            Where-Object { $_.SID -eq $sid }
+            Where-Object { $_.SID -eq $sid } |
+            Select-Object -First 1
 
-          if (-not $profile -or -not $profile.LocalPath) {
-            throw 'Tasfiq user profile was not created.'
+          if (-not $profile) {
+            Write-Warning 'Tasfiq profile does not exist yet. Skipping dark mode setup for now.'
+            exit 0
           }
 
-          $hiveFile = Join-Path $profile.LocalPath 'NTUSER.DAT'
-          $hiveName = "TasfiqTempHive_$env:GITHUB_RUN_ID"
-          $loadedByUs = $false
+          $ntUserDat = Join-Path $profile.LocalPath 'NTUSER.DAT'
 
-          if (Test-Path "Registry::HKEY_USERS\$sid") {
-            $registryRoot = "Registry::HKEY_USERS\$sid"
-          } else {
-            if (-not (Test-Path $hiveFile)) {
-              throw "User registry hive not found: $hiveFile"
-            }
-
-            & reg.exe load "HKU\$hiveName" $hiveFile
-
-            if ($LASTEXITCODE -ne 0) {
-              throw 'Failed to load Tasfiq user registry hive.'
-            }
-
-            $loadedByUs = $true
-            $registryRoot = "Registry::HKEY_USERS\$hiveName"
+          if (-not (Test-Path $ntUserDat)) {
+            Write-Warning 'Tasfiq NTUSER.DAT does not exist yet. Skipping dark mode setup for now.'
+            exit 0
           }
+
+          $hivePath = "Registry::HKEY_USERS\$sid"
+          $loadedByScript = $false
 
           try {
-            $personalize = Join-Path $registryRoot `
-              'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+            if (-not (Test-Path $hivePath)) {
+              & reg.exe load 'HKU\TasfiqTemp' $ntUserDat
+
+              if ($LASTEXITCODE -ne 0) {
+                throw 'Could not load Tasfiq user registry hive.'
+              }
+
+              $hivePath = 'Registry::HKEY_USERS\TasfiqTemp'
+              $loadedByScript = $true
+            }
+
+            $personalize = Join-Path $hivePath 'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
 
             New-Item -Path $personalize -Force | Out-Null
 
-            New-ItemProperty -Path $personalize `
-              -Name AppsUseLightTheme -PropertyType DWord `
-              -Value 0 -Force | Out-Null
-
-            New-ItemProperty -Path $personalize `
-              -Name SystemUsesLightTheme -PropertyType DWord `
-              -Value 0 -Force | Out-Null
-
-            New-ItemProperty -Path $personalize `
-              -Name EnableTransparency -PropertyType DWord `
-              -Value 0 -Force | Out-Null
+            Set-ItemProperty -Path $personalize -Name AppsUseLightTheme -Value 0 -Type DWord
+            Set-ItemProperty -Path $personalize -Name SystemUsesLightTheme -Value 0 -Type DWord
+            Set-ItemProperty -Path $personalize -Name EnableTransparency -Value 0 -Type DWord
 
             Write-Host 'Dark mode configured for Tasfiq.'
           }
           finally {
-            if ($loadedByUs) {
+            if ($loadedByScript) {
               [gc]::Collect()
               [gc]::WaitForPendingFinalizers()
-
-              & reg.exe unload "HKU\$hiveName"
-
-              if ($LASTEXITCODE -ne 0) {
-                Write-Warning 'Could not unload the temporary registry hive.'
-              }
+              & reg.exe unload 'HKU\TasfiqTemp' | Out-Null
             }
           }
 
@@ -182,17 +167,14 @@ jobs:
 
           Invoke-WebRequest -Uri $url -OutFile $file
 
-          try {
-            $process = Start-Process msiexec.exe `
-              -ArgumentList '/i', "`"$file`"", '/quiet', '/norestart' `
-              -Wait -PassThru
+          $process = Start-Process msiexec.exe `
+            -ArgumentList '/i', "`"$file`"", '/quiet', '/norestart' `
+            -Wait -PassThru
 
-            if ($process.ExitCode -notin @(0, 3010)) {
-              throw "Tailscale installation failed: $($process.ExitCode)"
-            }
-          }
-          finally {
-            Remove-Item $file -Force -ErrorAction SilentlyContinue
+          Remove-Item $file -Force -ErrorAction SilentlyContinue
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed: $($process.ExitCode)"
           }
 
       - name: Establish Tailscale connection
