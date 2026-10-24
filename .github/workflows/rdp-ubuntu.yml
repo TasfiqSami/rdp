@@ -1,4 +1,3 @@
-
 name: Ubuntu 24.04 LTS RDP
 
 on:
@@ -7,59 +6,79 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ubuntu-rdp-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   ubuntu-rdp:
+    name: Ubuntu RDP
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
     steps:
-      - name: Install and configure Ubuntu desktop
+      - name: Prepare Ubuntu desktop and XRDP
         shell: bash
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
 
-          if [[ -z "${RDP_PASSWORD:-}" ]]; then
-            echo "::error::Set the RDP_PASSWORD repository secret."
-            exit 1
-          fi
-
+          echo "Updating Ubuntu package indexes..."
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 xfce4-goodies xfce4-session xfce4-panel \
-            xfdesktop4 xfwm4 xfconf xfce4-terminal \
-            dbus-x11 dbus-user-session \
-            xrdp xorgxrdp xserver-xorg-core \
+
+          echo "Installing desktop and XRDP..."
+          sudo apt-get install -y --no-install-recommends \
+            xfce4 \
+            xfce4-session \
+            xfce4-panel \
+            xfdesktop4 \
+            xfwm4 \
+            xfconf \
+            xfce4-settings \
+            xfce4-terminal \
+            dbus-x11 \
+            dbus-user-session \
+            xrdp \
+            xorgxrdp \
+            xserver-xorg-core \
             x11-xserver-utils \
-            ca-certificates curl gnupg git wget unzip
+            xauth \
+            x11-utils \
+            ca-certificates \
+            curl \
+            wget \
+            git \
+            sudo \
+            openssl \
+            unzip \
+            tar \
+            procps \
+            net-tools
 
           if ! id Tasfiq >/dev/null 2>&1; then
-            sudo useradd --create-home --shell /bin/bash Tasfiq
+            sudo useradd -m -s /bin/bash Tasfiq
           fi
 
-          echo "Tasfiq:${RDP_PASSWORD}" | sudo chpasswd
-          unset RDP_PASSWORD
+          echo "Setting account password..."
+          echo "Tasfiq:${{ secrets.RDP_PASSWORD }}" | sudo chpasswd
 
           sudo usermod -aG sudo,ssl-cert Tasfiq
+
+          # Passwordless sudo is convenient for this temporary runner.
           echo 'Tasfiq ALL=(ALL) NOPASSWD:ALL' |
-            sudo tee /etc/sudoers.d/90-tasfiq-rdp >/dev/null
-          sudo chmod 0440 /etc/sudoers.d/90-tasfiq-rdp
-          sudo visudo -cf /etc/sudoers.d/90-tasfiq-rdp
+            sudo tee /etc/sudoers.d/90-tasfiq >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/90-tasfiq
+          sudo visudo -cf /etc/sudoers.d/90-tasfiq
 
-          # Prepare clean XFCE configuration directories.
+          # Create all directories before writing desktop configuration.
           sudo install -d -o Tasfiq -g Tasfiq \
-            /home/Tasfiq/.config \
-            /home/Tasfiq/.cache \
-            /home/Tasfiq/.local/share \
+            /home/Tasfiq/.local/bin \
             /home/Tasfiq/.config/autostart \
-            /home/Tasfiq/Desktop
+            /home/Tasfiq/.config/xfce4/xfconf/xfce-perchannel-xml \
+            /home/Tasfiq/Desktop \
+            /home/Tasfiq/.cache
 
-          # Remove stale session state from any previous login.
-          sudo rm -f /home/Tasfiq/.cache/sessions/*
-          sudo rm -f /home/Tasfiq/.Xauthority
-
-          # Start XFCE in a dedicated D-Bus session.
+          # Configure a reliable XFCE session for XRDP.
           sudo tee /home/Tasfiq/.xsession >/dev/null <<'XSESSION'
           #!/bin/sh
           unset DBUS_SESSION_BUS_ADDRESS
@@ -71,193 +90,279 @@ jobs:
           exec dbus-launch --exit-with-session startxfce4
           XSESSION
 
-          sudo chown Tasfiq:Tasfiq /home/Tasfiq/.xsession
           sudo chmod 0755 /home/Tasfiq/.xsession
 
-          # Enable and restart XRDP.
+          # Set a dark XFCE theme at the user configuration level.
+          sudo tee /home/Tasfiq/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml >/dev/null <<'XSETTINGS'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <channel name="xsettings" version="1.0">
+            <property name="Net" type="empty">
+              <property name="ThemeName" type="string" value="Adwaita-dark"/>
+              <property name="IconThemeName" type="string" value="Adwaita"/>
+            </property>
+            <property name="Xft" type="empty">
+              <property name="Antialias" type="int" value="1"/>
+              <property name="Hinting" type="int" value="1"/>
+              <property name="HintStyle" type="string" value="hintslight"/>
+            </property>
+          </channel>
+          XSETTINGS
+
+          sudo chown -R Tasfiq:Tasfiq /home/Tasfiq/.config /home/Tasfiq/.local \
+            /home/Tasfiq/Desktop /home/Tasfiq/.cache
+          sudo chown Tasfiq:Tasfiq /home/Tasfiq/.xsession
+
+          # Configure XRDP to use Xorg and start reliably.
           sudo adduser xrdp ssl-cert || true
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp
 
-          echo "XRDP service status:"
-          sudo systemctl --no-pager --full status xrdp || true
+          echo "Desktop and XRDP preparation completed."
 
-      - name: Configure first-login desktop setup
+      - name: Configure background application installer
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          sudo tee /home/Tasfiq/.local/bin/first-login-setup.sh >/dev/null <<'SETUP'
+          sudo install -d -o Tasfiq -g Tasfiq \
+            /home/Tasfiq/.local/bin \
+            /home/Tasfiq/.config/autostart \
+            /home/Tasfiq/Desktop
+
+          sudo tee /home/Tasfiq/.local/bin/install-apps-background.sh >/dev/null <<'INSTALLER'
           #!/usr/bin/env bash
           set -u
 
-          mkdir -p "$HOME/Desktop"
-          exec > >(tee -a "$HOME/Desktop/Install-Everything.log") 2>&1
+          mkdir -p "$HOME/Desktop" "$HOME/.cache"
+          LOG="$HOME/Desktop/Install-Everything.log"
 
-          echo "Desktop setup started: $(date -Is)"
-          sleep 10
+          # Keep the installer independent from the graphical session.
+          exec >>"$LOG" 2>&1
 
-          # Apply dark mode to XFCE after login.
-          if command -v xfconf-query >/dev/null 2>&1; then
-            xfconf-query -c xsettings -p /Net/ThemeName \
-              --create -t string -s "Adwaita-dark" || true
+          echo
+          echo "============================================"
+          echo "Background application installation started"
+          echo "Time: $(date -Is)"
+          echo "============================================"
+
+          # Prevent two copies of the installer running at once.
+          LOCK="$HOME/.cache/syxlor-rdp-app-install.lock"
+          if ! mkdir "$LOCK" 2>/dev/null; then
+            echo "An installation is already running. Exiting."
+            exit 0
           fi
+          trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
 
-          echo "Updating Ubuntu packages..."
-          sudo -n apt-get update || echo "WARNING: apt update failed"
+          export DEBIAN_FRONTEND=noninteractive
 
-          echo "Installing base tools..."
-          sudo -n apt-get install -y \
-            git curl wget gnupg ca-certificates || true
+          run_step() {
+            local title="$1"
+            shift
+            echo
+            echo ">>> $title"
+            if "$@"; then
+              echo "SUCCESS: $title"
+            else
+              echo "WARNING: $title failed. Continuing."
+            fi
+          }
 
-          # Install Brave Browser from its official repository.
-          echo "Installing Brave..."
+          # Use one initial package index refresh.
+          run_step "Update package indexes" sudo -n apt-get update
+
+          run_step "Install base developer tools" \
+            sudo -n apt-get install -y \
+              git curl wget gnupg ca-certificates \
+              apt-transport-https software-properties-common
+
+          # Add Brave's official repository.
           if ! command -v brave-browser >/dev/null 2>&1; then
-            curl -fsSLo /tmp/brave-keyring.gpg \
-              https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg || true
+            echo ">>> Configure Brave repository"
+            if curl -fsSLo /tmp/brave-keyring.gpg \
+              https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg; then
 
-            if [[ -s /tmp/brave-keyring.gpg ]]; then
               sudo -n install -m 0644 /tmp/brave-keyring.gpg \
                 /usr/share/keyrings/brave-browser-archive-keyring.gpg
 
               echo "deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg] https://brave-browser-apt-release.s3.brave.com/ stable main" |
                 sudo -n tee /etc/apt/sources.list.d/brave-browser-release.list >/dev/null
 
-              sudo -n apt-get update &&
-                sudo -n apt-get install -y brave-browser ||
-                echo "WARNING: Brave installation failed"
+              run_step "Refresh indexes for Brave" sudo -n apt-get update
+              run_step "Install Brave Browser" sudo -n apt-get install -y brave-browser
+            else
+              echo "WARNING: Could not download Brave's signing key."
             fi
+          else
+            echo "Brave is already installed."
           fi
 
-          # Install Visual Studio Code from Microsoft's repository.
-          echo "Installing VS Code..."
+          # Add Microsoft's official VS Code repository.
           if ! command -v code >/dev/null 2>&1; then
-            curl -fsSL https://packages.microsoft.com/keys/microsoft.asc |
-              gpg --dearmor > /tmp/ms-packages.gpg || true
+            echo ">>> Configure VS Code repository"
+            if curl -fsSL https://packages.microsoft.com/keys/microsoft.asc |
+              gpg --dearmor > /tmp/ms-packages.gpg; then
 
-            if [[ -s /tmp/ms-packages.gpg ]]; then
               sudo -n install -m 0644 /tmp/ms-packages.gpg \
                 /usr/share/keyrings/packages.microsoft.gpg
 
               echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" |
                 sudo -n tee /etc/apt/sources.list.d/vscode.list >/dev/null
 
-              sudo -n apt-get update &&
-                sudo -n apt-get install -y code ||
-                echo "WARNING: VS Code installation failed"
+              run_step "Refresh indexes for VS Code" sudo -n apt-get update
+              run_step "Install Visual Studio Code" sudo -n apt-get install -y code
+            else
+              echo "WARNING: Could not download the Microsoft signing key."
             fi
+          else
+            echo "VS Code is already installed."
           fi
 
-          # Install GitHub CLI.
-          echo "Installing GitHub CLI..."
+          # Add GitHub CLI's official repository.
           if ! command -v gh >/dev/null 2>&1; then
-            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg |
-              sudo -n dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg status=none || true
+            echo ">>> Configure GitHub CLI repository"
+            if curl -fsSL \
+              https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+              -o /tmp/githubcli-archive-keyring.gpg; then
 
-            if [[ -s /usr/share/keyrings/githubcli-archive-keyring.gpg ]]; then
-              sudo -n chmod 0644 /usr/share/keyrings/githubcli-archive-keyring.gpg
+              sudo -n install -m 0644 /tmp/githubcli-archive-keyring.gpg \
+                /usr/share/keyrings/githubcli-archive-keyring.gpg
 
               echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" |
                 sudo -n tee /etc/apt/sources.list.d/github-cli.list >/dev/null
 
-              sudo -n apt-get update &&
-                sudo -n apt-get install -y gh ||
-                echo "WARNING: GitHub CLI installation failed"
+              run_step "Refresh indexes for GitHub CLI" sudo -n apt-get update
+              run_step "Install GitHub CLI" sudo -n apt-get install -y gh
+            else
+              echo "WARNING: Could not download GitHub CLI's signing key."
             fi
-          fi
-
-          # Install the current Node.js LTS release.
-          echo "Installing Node.js LTS..."
-          curl -fsSL https://deb.nodesource.com/setup_lts.x \
-            -o /tmp/nodesource-setup.sh || true
-
-          if [[ -s /tmp/nodesource-setup.sh ]]; then
-            sudo -n bash /tmp/nodesource-setup.sh &&
-              sudo -n apt-get install -y nodejs ||
-              echo "WARNING: Node.js installation failed"
-          fi
-
-          # Install Discord's official Linux .deb package.
-          echo "Installing Discord..."
-          if curl -fL --retry 2 \
-            "https://discord.com/api/download?platform=linux&format=deb" \
-            -o /tmp/discord.deb; then
-            sudo -n apt-get install -y /tmp/discord.deb ||
-              echo "WARNING: Discord installation failed"
           else
-            echo "WARNING: Discord download failed"
+            echo "GitHub CLI is already installed."
           fi
 
-          # Install developer command-line tools.
-          echo "Installing developer CLIs..."
+          # Install current Node.js LTS using NodeSource.
+          if ! command -v node >/dev/null 2>&1 ||
+             ! command -v npm >/dev/null 2>&1; then
+            echo ">>> Configure Node.js LTS"
+            if curl -fsSL https://deb.nodesource.com/setup_lts.x \
+              -o /tmp/nodesource-setup.sh; then
+              run_step "Configure Node.js repository" \
+                sudo -n bash /tmp/nodesource-setup.sh
+              run_step "Install Node.js LTS and npm" \
+                sudo -n apt-get install -y nodejs
+            else
+              echo "WARNING: Could not download the NodeSource setup script."
+            fi
+          else
+            echo "Node.js and npm are already installed."
+          fi
+
+          # Install Discord only if not already installed.
+          if ! command -v discord >/dev/null 2>&1; then
+            echo ">>> Download Discord"
+            if curl -fL --retry 2 \
+              "https://discord.com/api/download?platform=linux&format=deb" \
+              -o /tmp/discord.deb; then
+              run_step "Install Discord" sudo -n apt-get install -y /tmp/discord.deb
+            else
+              echo "WARNING: Discord download failed."
+            fi
+          else
+            echo "Discord appears to be installed already."
+          fi
+
+          # Install CLI packages one by one so one failure doesn't block others.
           if command -v npm >/dev/null 2>&1; then
-            sudo -n npm install -g \
-              @openai/codex \
-              @anthropic-ai/claude-code \
-              vercel \
-              @github/copilot ||
-              echo "WARNING: One or more CLI installations failed"
+            run_step "Install OpenAI Codex CLI" \
+              sudo -n npm install -g @openai/codex
+
+            run_step "Install Claude Code CLI" \
+              sudo -n npm install -g @anthropic-ai/claude-code
+
+            run_step "Install Vercel CLI" \
+              sudo -n npm install -g vercel
+
+            run_step "Install GitHub Copilot CLI" \
+              sudo -n npm install -g @github/copilot
           else
-            echo "WARNING: npm is unavailable"
+            echo "WARNING: npm is unavailable; skipping developer CLIs."
           fi
 
-          echo "Google Antigravity and ChatGPT desktop require compatible official Linux packages."
-          echo "Neat Download Manager's Windows installer cannot run natively on Ubuntu."
-          echo "Desktop setup finished: $(date -Is)"
-          SETUP
+          echo
+          echo "============================================"
+          echo "Background application installation finished"
+          echo "Time: $(date -Is)"
+          echo "Check this file for individual results:"
+          echo "$LOG"
+          echo "============================================"
+          INSTALLER
 
-          sudo chmod 0755 /home/Tasfiq/.local/bin/first-login-setup.sh
-          sudo chown -R Tasfiq:Tasfiq /home/Tasfiq/.local
+          sudo chmod 0755 /home/Tasfiq/.local/bin/install-apps-background.sh
+          sudo chown Tasfiq:Tasfiq /home/Tasfiq/.local/bin/install-apps-background.sh
 
-          sudo tee /home/Tasfiq/.config/autostart/first-login-setup.desktop >/dev/null <<'DESKTOP'
+          # Launch after login, but don't block desktop startup.
+          sudo tee /home/Tasfiq/.config/autostart/install-apps-background.desktop >/dev/null <<'DESKTOP'
           [Desktop Entry]
           Type=Application
-          Name=First Login Setup
-          Comment=Apply dark mode and install compatible apps
-          Exec=/home/Tasfiq/.local/bin/first-login-setup.sh
+          Name=Background App Installer
+          Comment=Install developer tools in the background
+          Exec=/home/Tasfiq/.local/bin/install-apps-background.sh
           Terminal=false
           X-GNOME-Autostart-enabled=true
           DESKTOP
 
           sudo chown Tasfiq:Tasfiq \
-            /home/Tasfiq/.config/autostart/first-login-setup.desktop
+            /home/Tasfiq/.config/autostart/install-apps-background.desktop
+
+          echo "Background installer configured."
 
       - name: Connect Tailscale
         uses: tailscale/github-action@v3
         with:
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          args: --hostname=ubuntu-rdp-${{ github.run_id }}
+          args: --accept-dns=true
+          hostname: ubuntu-rdp-${{ github.run_id }}
 
-      - name: Show connection details
+      - name: Show RDP connection details
         shell: bash
         run: |
           set -Eeuo pipefail
-          echo "Tailscale IP:"
-          tailscale ip -4
-          echo "RDP port: 3389"
-          echo "Username: Tasfiq"
-          echo "Password: use your RDP_PASSWORD GitHub secret"
-          echo "Connect using the Tailscale IP, not a public IP."
 
-      - name: Collect XRDP diagnostics
-        if: always()
-        shell: bash
-        run: |
-          sudo journalctl -u xrdp -u xrdp-sesman \
-            --no-pager -n 150 || true
-          sudo tail -n 150 /var/log/xrdp.log || true
-          sudo tail -n 150 /var/log/xrdp-sesman.log || true
-          sudo find /home/Tasfiq -maxdepth 3 \
-            -type f \( -name '.xsession-errors' -o -name '*.log' \) \
-            -print || true
+          echo "============================================"
+          echo "Ubuntu 24.04 LTS RDP is ready"
+          echo "============================================"
+          echo "Username: Tasfiq"
+          echo "Password: Use your RDP_PASSWORD repository secret"
+          echo "Host: Tailscale IP shown below"
+          echo "Port: 3389"
+          echo
+          echo "Tailscale IPv4:"
+          tailscale ip -4 || true
+          echo
+          echo "Connect using your RDP client."
+          echo "The desktop should be usable while applications install."
+          echo "Installation log: ~/Desktop/Install-Everything.log"
+          echo "============================================"
 
       - name: Keep runner alive
         shell: bash
         run: |
           set -Eeuo pipefail
+          echo "Runner will remain active until GitHub Actions reaches its job timeout."
           while true; do
-            if ! sudo systemctl is-active --quiet xrdp; then
-              sudo systemctl restart xrdp || true
-            fi
-            sleep 60
+            sleep 300
           done
+
+      - name: Collect XRDP diagnostics
+        if: always()
+        shell: bash
+        run: |
+          echo "===== XRDP service ====="
+          sudo systemctl status xrdp --no-pager || true
+
+          echo
+          echo "===== XRDP journal ====="
+          sudo journalctl -u xrdp -u xrdp-sesman -n 150 --no-pager || true
+
+          echo
+          echo "===== XRDP logs ====="
+          sudo tail -n 150 /var/log/xrdp.log /var/log/xrdp-sesman.log 2>/dev/null || true
