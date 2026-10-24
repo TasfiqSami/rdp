@@ -28,7 +28,7 @@ jobs:
           # Install a lightweight graphical desktop and xrdp.
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 xfce4-goodies xrdp dbus-x11 \
+            xfce4 xfce4-goodies xfce4-terminal xrdp xorgxrdp dbus-x11 x11-xserver-utils \
             ca-certificates curl gnupg lsb-release \
             git unzip wget software-properties-common
 
@@ -46,10 +46,29 @@ jobs:
           sudo chmod 0440 /etc/sudoers.d/90-tasfiq-rdp
           sudo visudo -cf /etc/sudoers.d/90-tasfiq-rdp
 
-          # Start XFCE for xrdp sessions.
-          echo 'startxfce4' | sudo tee /home/Tasfiq/.xsession >/dev/null
+          # Start a clean XFCE session for each RDP login.
+          # Clearing inherited DBus variables avoids stale session-bus failures.
+          sudo tee /home/Tasfiq/.xsession >/dev/null <<'XSESSION'
+          #!/bin/sh
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec startxfce4
+          XSESSION
           sudo chown Tasfiq:Tasfiq /home/Tasfiq/.xsession
-          sudo chmod 0644 /home/Tasfiq/.xsession
+          sudo chmod 0755 /home/Tasfiq/.xsession
+
+          # Explicitly point xrdp at Ubuntu's Xorg binary when the packaged
+          # configuration has an empty or invalid Xorg parameter.
+          if [[ -f /etc/xrdp/sesman.ini ]]; then
+            XORG_PATH="$(command -v Xorg || true)"
+            if [[ -z "$XORG_PATH" ]]; then
+              XORG_PATH="/usr/lib/xorg/Xorg"
+            fi
+            sudo sed -i -E "/^\[Xorg\]/,/^\[/{s|^param=.*|param=${XORG_PATH}|;}" /etc/xrdp/sesman.ini
+            if ! sudo awk '/^\[Xorg\]/{in_xorg=1; next} /^\[/{in_xorg=0} in_xorg && /^param=/{found=1} END{exit !found}' /etc/xrdp/sesman.ini; then
+              sudo sed -i "/^\[Xorg\]/a param=${XORG_PATH}" /etc/xrdp/sesman.ini
+            fi
+          fi
 
           # Ensure xrdp uses TLS certificates and is enabled.
           sudo adduser xrdp ssl-cert || true
@@ -65,7 +84,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          sudo -u Tasfiq mkdir -p /home/Tasfiq/.config/autostart /home/Tasfiq/.local/bin /home/Tasfiq/.local/share
+          sudo -u Tasfiq mkdir -p /home/Tasfiq/.config/autostart /home/Tasfiq/.local/bin /home/Tasfiq/.local/share /home/Tasfiq/Desktop
           sudo tee /home/Tasfiq/.local/bin/rdp-first-login-setup.sh >/dev/null <<'SETUP_SCRIPT'
           #!/usr/bin/env bash
           set -u
