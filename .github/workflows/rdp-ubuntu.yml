@@ -130,10 +130,10 @@ jobs:
 
       - name: Connect Tailscale
         env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           if [ -z "$TS_AUTHKEY" ]; then
-            echo "TAILSCALE_AUTHKEY secret is missing"; exit 1
+            echo "TAILSCALE_AUTH_KEY secret is missing"; exit 1
           fi
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo systemctl enable --now tailscaled
