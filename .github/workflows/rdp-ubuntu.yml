@@ -21,47 +21,60 @@ jobs:
           set -Eeuo pipefail
 
           if [[ -z "${RDP_PASSWORD:-}" ]]; then
-            echo "::error::Add the RDP_PASSWORD repository secret."
+            echo "::error::Set the RDP_PASSWORD repository secret."
             exit 1
           fi
 
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 xfce4-goodies xfce4-terminal \
+            xfce4 xfce4-goodies xfce4-session xfce4-panel \
+            xfdesktop4 xfwm4 xfconf xfce4-terminal \
+            dbus-x11 dbus-user-session \
             xrdp xorgxrdp xserver-xorg-core \
-            dbus-x11 x11-xserver-utils \
+            x11-xserver-utils \
             ca-certificates curl gnupg git wget unzip
 
           if ! id Tasfiq >/dev/null 2>&1; then
-            sudo useradd -m -s /bin/bash Tasfiq
+            sudo useradd --create-home --shell /bin/bash Tasfiq
           fi
 
           echo "Tasfiq:${RDP_PASSWORD}" | sudo chpasswd
           unset RDP_PASSWORD
 
           sudo usermod -aG sudo,ssl-cert Tasfiq
-          echo 'Tasfiq ALL=(ALL) NOPASSWD:ALL' | \
+          echo 'Tasfiq ALL=(ALL) NOPASSWD:ALL' |
             sudo tee /etc/sudoers.d/90-tasfiq-rdp >/dev/null
           sudo chmod 0440 /etc/sudoers.d/90-tasfiq-rdp
           sudo visudo -cf /etc/sudoers.d/90-tasfiq-rdp
 
-          # Configure a clean XFCE session for XRDP.
-          sudo -u Tasfiq mkdir -p \
+          # Prepare clean XFCE configuration directories.
+          sudo install -d -o Tasfiq -g Tasfiq \
+            /home/Tasfiq/.config \
+            /home/Tasfiq/.cache \
+            /home/Tasfiq/.local/share \
             /home/Tasfiq/.config/autostart \
-            /home/Tasfiq/.local/bin \
             /home/Tasfiq/Desktop
 
-          printf '%s\n' \
-            '#!/bin/sh' \
-            'unset DBUS_SESSION_BUS_ADDRESS' \
-            'unset XDG_RUNTIME_DIR' \
-            'exec startxfce4' |
-            sudo tee /home/Tasfiq/.xsession >/dev/null
+          # Remove stale session state from any previous login.
+          sudo rm -f /home/Tasfiq/.cache/sessions/*
+          sudo rm -f /home/Tasfiq/.Xauthority
+
+          # Start XFCE in a dedicated D-Bus session.
+          sudo tee /home/Tasfiq/.xsession >/dev/null <<'XSESSION'
+          #!/bin/sh
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset SESSION_MANAGER
+          unset XDG_RUNTIME_DIR
+          export XDG_CONFIG_DIRS=/etc/xdg
+          export XDG_CONFIG_HOME="$HOME/.config"
+          export XDG_CACHE_HOME="$HOME/.cache"
+          exec dbus-launch --exit-with-session startxfce4
+          XSESSION
 
           sudo chown Tasfiq:Tasfiq /home/Tasfiq/.xsession
           sudo chmod 0755 /home/Tasfiq/.xsession
 
-          # Use Xorg for the XRDP session.
+          # Enable and restart XRDP.
           sudo adduser xrdp ssl-cert || true
           sudo systemctl enable xrdp
           sudo systemctl restart xrdp
@@ -69,7 +82,7 @@ jobs:
           echo "XRDP service status:"
           sudo systemctl --no-pager --full status xrdp || true
 
-      - name: Configure post-login setup
+      - name: Configure first-login desktop setup
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -82,25 +95,22 @@ jobs:
           exec > >(tee -a "$HOME/Desktop/Install-Everything.log") 2>&1
 
           echo "Desktop setup started: $(date -Is)"
-
-          # Apply dark mode after the graphical session starts.
           sleep 10
+
+          # Apply dark mode to XFCE after login.
           if command -v xfconf-query >/dev/null 2>&1; then
             xfconf-query -c xsettings -p /Net/ThemeName \
               --create -t string -s "Adwaita-dark" || true
           fi
-          if command -v gsettings >/dev/null 2>&1; then
-            gsettings set org.gnome.desktop.interface color-scheme \
-              'prefer-dark' 2>/dev/null || true
-          fi
 
-          echo "Updating package lists..."
+          echo "Updating Ubuntu packages..."
           sudo -n apt-get update || echo "WARNING: apt update failed"
 
           echo "Installing base tools..."
           sudo -n apt-get install -y \
             git curl wget gnupg ca-certificates || true
 
+          # Install Brave Browser from its official repository.
           echo "Installing Brave..."
           if ! command -v brave-browser >/dev/null 2>&1; then
             curl -fsSLo /tmp/brave-keyring.gpg \
@@ -119,6 +129,7 @@ jobs:
             fi
           fi
 
+          # Install Visual Studio Code from Microsoft's repository.
           echo "Installing VS Code..."
           if ! command -v code >/dev/null 2>&1; then
             curl -fsSL https://packages.microsoft.com/keys/microsoft.asc |
@@ -137,6 +148,7 @@ jobs:
             fi
           fi
 
+          # Install GitHub CLI.
           echo "Installing GitHub CLI..."
           if ! command -v gh >/dev/null 2>&1; then
             curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg |
@@ -154,6 +166,7 @@ jobs:
             fi
           fi
 
+          # Install the current Node.js LTS release.
           echo "Installing Node.js LTS..."
           curl -fsSL https://deb.nodesource.com/setup_lts.x \
             -o /tmp/nodesource-setup.sh || true
@@ -164,6 +177,7 @@ jobs:
               echo "WARNING: Node.js installation failed"
           fi
 
+          # Install Discord's official Linux .deb package.
           echo "Installing Discord..."
           if curl -fL --retry 2 \
             "https://discord.com/api/download?platform=linux&format=deb" \
@@ -174,6 +188,7 @@ jobs:
             echo "WARNING: Discord download failed"
           fi
 
+          # Install developer command-line tools.
           echo "Installing developer CLIs..."
           if command -v npm >/dev/null 2>&1; then
             sudo -n npm install -g \
@@ -181,11 +196,13 @@ jobs:
               @anthropic-ai/claude-code \
               vercel \
               @github/copilot ||
-              echo "WARNING: One or more CLI installs failed"
+              echo "WARNING: One or more CLI installations failed"
+          else
+            echo "WARNING: npm is unavailable"
           fi
 
-          echo "Antigravity and ChatGPT desktop require a compatible official Linux package."
-          echo "Neat Download Manager's Windows installer cannot be used natively on Ubuntu."
+          echo "Google Antigravity and ChatGPT desktop require compatible official Linux packages."
+          echo "Neat Download Manager's Windows installer cannot run natively on Ubuntu."
           echo "Desktop setup finished: $(date -Is)"
           SETUP
 
@@ -215,20 +232,29 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
           echo "Tailscale IP:"
           tailscale ip -4
-
           echo "RDP port: 3389"
           echo "Username: Tasfiq"
-          echo "Password: your RDP_PASSWORD GitHub secret"
+          echo "Password: use your RDP_PASSWORD GitHub secret"
           echo "Connect using the Tailscale IP, not a public IP."
+
+      - name: Collect XRDP diagnostics
+        if: always()
+        shell: bash
+        run: |
+          sudo journalctl -u xrdp -u xrdp-sesman \
+            --no-pager -n 150 || true
+          sudo tail -n 150 /var/log/xrdp.log || true
+          sudo tail -n 150 /var/log/xrdp-sesman.log || true
+          sudo find /home/Tasfiq -maxdepth 3 \
+            -type f \( -name '.xsession-errors' -o -name '*.log' \) \
+            -print || true
 
       - name: Keep runner alive
         shell: bash
         run: |
           set -Eeuo pipefail
-
           while true; do
             if ! sudo systemctl is-active --quiet xrdp; then
               sudo systemctl restart xrdp || true
