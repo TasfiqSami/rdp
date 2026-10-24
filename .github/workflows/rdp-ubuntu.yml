@@ -3,9 +3,12 @@ name: Ubuntu
 on:
   workflow_dispatch:
 
+env:
+  RDP_USER: tasfiq
+
 jobs:
   rdp:
-    runs-on: ubuntu-24.04   # Ubuntu 24.04 LTS
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
 
     steps:
@@ -15,25 +18,33 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            xfce4 xfce4-terminal xfce4-goodies dbus-x11 \
+            xfce4 xfce4-terminal xfce4-goodies dbus-x11 x11-xserver-utils \
             greybird-gtk-theme gnome-themes-extra \
             xrdp xorgxrdp curl ca-certificates wget gpg
           sudo adduser xrdp ssl-cert
-          sudo systemctl enable --now xrdp
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
 
-      - name: Create user Tasfiq
+      - name: Create user
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           if [ -z "$RDP_PASSWORD" ]; then
             echo "RDP_PASSWORD secret is missing"; exit 1
           fi
-          sudo useradd -m -s /bin/bash -G sudo tasfiq
-          echo "tasfiq:$RDP_PASSWORD" | sudo chpasswd
-          echo "tasfiq ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/tasfiq
-          sudo chmod 440 /etc/sudoers.d/tasfiq
-          echo "xfce4-session" | sudo -u tasfiq tee /home/tasfiq/.xsession
-          sudo mkdir -p /home/tasfiq/Desktop /home/tasfiq/.config/autostart
+          H="/home/$RDP_USER"
+
+          sudo useradd -m -s /bin/bash -G sudo "$RDP_USER"
+          echo "$RDP_USER:$RDP_PASSWORD" | sudo chpasswd
+          echo "$RDP_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/$RDP_USER" >/dev/null
+          sudo chmod 440 "/etc/sudoers.d/$RDP_USER"
+
+          # Create every folder before writing into it
+          sudo mkdir -p "$H/.local/bin" "$H/.config/autostart" "$H/Desktop"
+          sudo mkdir -p /etc/polkit-1/rules.d
+
+          echo "xfce4-session" | sudo tee "$H/.xsession" >/dev/null
+
           # Stop the colour-profile auth popup in xrdp sessions
           sudo tee /etc/polkit-1/rules.d/45-allow-colord.rules >/dev/null <<'EOF'
           polkit.addRule(function(action, subject) {
@@ -43,10 +54,12 @@ jobs:
           });
           EOF
 
-      - name: Configure first-login tasks (dark mode and app installer)
+      - name: Configure first-login setup
         run: |
-          # Dark mode, applied inside the user's session at login
-          sudo tee /home/tasfiq/dark-mode.sh >/dev/null <<'EOF'
+          H="/home/$RDP_USER"
+
+          # Dark mode (runs inside the user's session)
+          sudo tee "$H/.local/bin/dark-mode.sh" >/dev/null <<'EOF'
           #!/bin/bash
           sleep 5
           xfconf-query -c xsettings -p /Net/ThemeName --create -t string -s "Greybird-dark"
@@ -54,8 +67,8 @@ jobs:
           gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark' 2>/dev/null || true
           EOF
 
-          # App installer, runs once after the first sign-in
-          sudo tee /home/tasfiq/install-everything.sh >/dev/null <<'EOF'
+          # App installer (runs once after first sign-in)
+          sudo tee "$H/.local/bin/install-everything.sh" >/dev/null <<'EOF'
           #!/bin/bash
           MARK="$HOME/.install-everything.done"
           LOG="$HOME/Desktop/Install-Everything.log"
@@ -64,38 +77,56 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           {
             echo "== Install started: $(date) =="
+
+            echo "--- adding Brave repository"
+            sudo curl -fsSLo /usr/share/keyrings/brave-browser-archive-keyring.gpg \
+              https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg \
+              || echo "FAILED: brave keyring"
+            echo "deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg] https://brave-browser-apt-release.s3.brave.com/ stable main" \
+              | sudo tee /etc/apt/sources.list.d/brave-browser-release.list >/dev/null
+
             sudo apt-get update
+
+            echo "--- apt: brave-browser"
+            sudo apt-get install -y brave-browser || echo "FAILED: brave-browser"
+
             for pkg in git vlc htop btop neofetch build-essential python3-pip nodejs npm; do
               echo "--- apt: $pkg"
               sudo apt-get install -y "$pkg" || echo "FAILED: $pkg"
             done
-            for snap in firefox; do
-              echo "--- snap: $snap"
-              sudo snap install "$snap" || echo "FAILED: $snap"
-            done
-            echo "--- snap: code (classic)"
+
+            echo "--- snap: code"
             sudo snap install code --classic || echo "FAILED: code"
+
             echo "== Install finished: $(date) =="
           } >> "$LOG" 2>&1
           EOF
 
-          sudo chmod +x /home/tasfiq/dark-mode.sh /home/tasfiq/install-everything.sh
+          sudo chmod 0755 "$H/.local/bin/dark-mode.sh" "$H/.local/bin/install-everything.sh"
 
-          sudo tee /home/tasfiq/.config/autostart/dark-mode.desktop >/dev/null <<'EOF'
+          sudo tee "$H/.config/autostart/dark-mode.desktop" >/dev/null <<EOF
           [Desktop Entry]
           Type=Application
           Name=Dark Mode
-          Exec=/home/tasfiq/dark-mode.sh
+          Exec=$H/.local/bin/dark-mode.sh
+          Terminal=false
+          X-GNOME-Autostart-enabled=true
           EOF
 
-          sudo tee /home/tasfiq/.config/autostart/install-everything.desktop >/dev/null <<'EOF'
+          sudo tee "$H/.config/autostart/install-everything.desktop" >/dev/null <<EOF
           [Desktop Entry]
           Type=Application
           Name=Install Everything
-          Exec=/home/tasfiq/install-everything.sh
+          Exec=$H/.local/bin/install-everything.sh
+          Terminal=false
+          X-GNOME-Autostart-enabled=true
           EOF
 
-          sudo chown -R tasfiq:tasfiq /home/tasfiq
+          # Give the user ownership of everything we created
+          sudo chown -R "$RDP_USER:$RDP_USER" "$H"
+
+          echo "--- Verifying files"
+          ls -la "$H/.local/bin" "$H/.config/autostart"
 
       - name: Connect Tailscale
         env:
@@ -105,17 +136,19 @@ jobs:
             echo "TAILSCALE_AUTHKEY secret is missing"; exit 1
           fi
           curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled
+          sleep 3
           sudo tailscale up --authkey="$TS_AUTHKEY" --hostname="gh-rdp-ubuntu" --accept-dns=false
           echo "=============================================="
           echo "Tailscale IP: $(tailscale ip -4)"
           echo "Connect with Remote Desktop to that IP"
-          echo "Username: tasfiq"
+          echo "Username: $RDP_USER"
           echo "=============================================="
 
       - name: Keep session alive
         run: |
           echo "Tailscale IP: $(tailscale ip -4)"
-          END=$((SECONDS + 21000))   # ~5h50m, under the 6h job limit
+          END=$((SECONDS + 21000))   # about 5h50m, under the 6h limit
           while [ $SECONDS -lt $END ]; do
             sleep 60
           done
