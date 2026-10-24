@@ -34,7 +34,11 @@ jobs:
           fi
           H="/home/$RDP_USER"
 
-          sudo useradd -m -s /bin/bash -G sudo "$RDP_USER"
+          if id "$RDP_USER" >/dev/null 2>&1; then
+            echo "User $RDP_USER already exists, skipping useradd"
+          else
+            sudo useradd -m -s /bin/bash -G sudo "$RDP_USER"
+          fi
           echo "$RDP_USER:$RDP_PASSWORD" | sudo chpasswd
           echo "$RDP_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/$RDP_USER" >/dev/null
           sudo chmod 440 "/etc/sudoers.d/$RDP_USER"
@@ -43,7 +47,17 @@ jobs:
           sudo mkdir -p "$H/.local/bin" "$H/.config/autostart" "$H/Desktop"
           sudo mkdir -p /etc/polkit-1/rules.d
 
-          echo "xfce4-session" | sudo tee "$H/.xsession" >/dev/null
+          # Start XFCE inside its own D-Bus session
+          sudo tee "$H/.xsession" >/dev/null <<'EOF'
+          #!/bin/bash
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          export XDG_SESSION_DESKTOP=xfce
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_CONFIG_DIRS=/etc/xdg
+          exec dbus-launch --exit-with-session startxfce4
+          EOF
+          sudo chmod 0755 "$H/.xsession"
 
           # Stop the colour-profile auth popup in xrdp sessions
           sudo tee /etc/polkit-1/rules.d/45-allow-colord.rules >/dev/null <<'EOF'
@@ -61,7 +75,7 @@ jobs:
           # Dark mode (runs inside the user's session)
           sudo tee "$H/.local/bin/dark-mode.sh" >/dev/null <<'EOF'
           #!/bin/bash
-          sleep 5
+          sleep 8
           xfconf-query -c xsettings -p /Net/ThemeName --create -t string -s "Greybird-dark"
           xfconf-query -c xfwm4 -p /general/theme --create -t string -s "Greybird-dark"
           gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark' 2>/dev/null || true
@@ -126,7 +140,7 @@ jobs:
           sudo chown -R "$RDP_USER:$RDP_USER" "$H"
 
           echo "--- Verifying files"
-          ls -la "$H/.local/bin" "$H/.config/autostart"
+          ls -la "$H" "$H/.local/bin" "$H/.config/autostart"
 
       - name: Connect Tailscale
         env:
