@@ -17,13 +17,12 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            xfce4 xfce4-terminal xfce4-goodies dbus-x11 x11-xserver-utils \
+          sudo apt-get install -y \
+            xfce4 xfce4-session xfconf xfce4-settings xfce4-terminal thunar \
+            dbus dbus-x11 x11-xserver-utils \
             greybird-gtk-theme gnome-themes-extra \
             xrdp xorgxrdp curl ca-certificates wget gpg
           sudo adduser xrdp ssl-cert
-          sudo systemctl enable xrdp
-          sudo systemctl restart xrdp
 
       - name: Create user
         env:
@@ -47,18 +46,6 @@ jobs:
           sudo mkdir -p "$H/.local/bin" "$H/.config/autostart" "$H/Desktop"
           sudo mkdir -p /etc/polkit-1/rules.d
 
-          # Start XFCE inside its own D-Bus session
-          sudo tee "$H/.xsession" >/dev/null <<'EOF'
-          #!/bin/bash
-          unset DBUS_SESSION_BUS_ADDRESS
-          unset XDG_RUNTIME_DIR
-          export XDG_SESSION_DESKTOP=xfce
-          export XDG_CURRENT_DESKTOP=XFCE
-          export XDG_CONFIG_DIRS=/etc/xdg
-          exec dbus-launch --exit-with-session startxfce4
-          EOF
-          sudo chmod 0755 "$H/.xsession"
-
           # Stop the colour-profile auth popup in xrdp sessions
           sudo tee /etc/polkit-1/rules.d/45-allow-colord.rules >/dev/null <<'EOF'
           polkit.addRule(function(action, subject) {
@@ -67,6 +54,31 @@ jobs:
             }
           });
           EOF
+
+      - name: Configure xrdp to start XFCE correctly
+        run: |
+          H="/home/$RDP_USER"
+
+          # Replace xrdp's session startup script with a clean XFCE launcher
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'EOF'
+          #!/bin/bash
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          export XDG_SESSION_DESKTOP=xfce
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_TYPE=x11
+          export XDG_CONFIG_DIRS=/etc/xdg
+          export XDG_DATA_DIRS=/usr/share:/usr/local/share
+          [ -r /etc/profile ] && . /etc/profile
+          exec dbus-launch --exit-with-session startxfce4
+          EOF
+          sudo chmod 0755 /etc/xrdp/startwm.sh
+
+          # Remove any user-level override so startwm.sh is used
+          sudo rm -f "$H/.xsession" "$H/.xsessionrc"
+
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
 
       - name: Configure first-login setup
         run: |
@@ -139,8 +151,21 @@ jobs:
           # Give the user ownership of everything we created
           sudo chown -R "$RDP_USER:$RDP_USER" "$H"
 
-          echo "--- Verifying files"
-          ls -la "$H" "$H/.local/bin" "$H/.config/autostart"
+      - name: Diagnostics (checks XFCE config is found)
+        continue-on-error: true
+        run: |
+          echo "--- xfce4-session default config:"
+          ls -la /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/ || true
+          echo "--- xfconfd binary:"
+          find /usr -name xfconfd 2>/dev/null || true
+          echo "--- FailsafeSessionName as $RDP_USER (should print Failsafe):"
+          sudo -u "$RDP_USER" env HOME="/home/$RDP_USER" XDG_CONFIG_DIRS=/etc/xdg \
+            dbus-launch --exit-with-session \
+            xfconf-query -c xfce4-session -p /general/FailsafeSessionName || true
+          echo "--- startwm.sh:"
+          cat /etc/xrdp/startwm.sh
+          echo "--- xrdp status:"
+          systemctl is-active xrdp || true
 
       - name: Connect Tailscale
         env:
